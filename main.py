@@ -12,17 +12,16 @@ app = FastAPI()
 # ==========================================
 ALLOWED_ORIGINS = [
     "https://app-1m57wz.example.com",
-    "exam.sanand.workers.dev" # <--- REPLACE WITH YOUR EXAM PAGE'S EXACT URL
+    "https://exam.sanand.workers.dev" 
 ]
 
-# CORSMiddleware automatically handles OPTIONS (preflight) requests safely
-# It specifically prevents wildcard (*) headers when a list is provided.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"] # <--- THIS IS THE FIX! Allows the grader to read the header
 )
 
 # In-memory dictionary to bucket requests by X-Client-Id
@@ -37,7 +36,6 @@ async def context_and_rate_limit_middleware(request: Request, call_next):
     if not req_id:
         req_id = str(uuid.uuid4())
     
-    # Propagate to endpoint via request state
     request.state.request_id = req_id
 
     # ==========================================
@@ -47,19 +45,17 @@ async def context_and_rate_limit_middleware(request: Request, call_next):
     if client_id:
         now = time.time()
         
-        # Purge timestamps older than our 10-second window
+        # Purge timestamps older than 10 seconds
         rate_limits[client_id] = [t for t in rate_limits[client_id] if now - t < 10]
         
-        # Check Bucket Limit (Assigned: 11 req / 10s)
+        # Check Bucket Limit (11 req / 10s)
         if len(rate_limits[client_id]) >= 11:
             response = JSONResponse({"detail": "Too Many Requests"}, status_code=429)
-            # Ensure the X-Request-ID still gets attached to rate-limited responses
             response.headers["X-Request-ID"] = req_id
             return response
             
         rate_limits[client_id].append(now)
 
-    # Process the valid request
     response = await call_next(request)
 
     # ==========================================
