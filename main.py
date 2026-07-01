@@ -11,8 +11,8 @@ app = FastAPI()
 # Middleware 2: CORS Configuration
 # ==========================================
 ALLOWED_ORIGINS = [
-    "https://exam.sanand.workers.dev/tds-2026-05-ga2#hq-config-precedence-server",
-    "YOUR_EXAM_PORTAL_ORIGIN_HERE" # <--- REPLACE WITH YOUR EXAM PAGE'S EXACT URL
+    "https://app-1m57wz.example.com",
+    "https://exam.sanand.workers.dev/tds-2026-05-ga2#hq-config-precedence-server" # <--- REPLACE WITH YOUR EXAM PAGE'S EXACT URL
 ]
 
 # CORSMiddleware automatically handles OPTIONS (preflight) requests safely
