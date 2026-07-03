@@ -1,172 +1,152 @@
 import time
-import uuid
-import re
+import base64
 from collections import defaultdict
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 app = FastAPI()
 
-# ==========================================
-# Middleware 2: CORS Configuration
-# ==========================================
-ALLOWED_ORIGINS = [
-    "https://app-1m57wz.example.com",
-    "https://exam.sanand.workers.dev" 
-]
+Enable CORS for the grader
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Request-ID"] 
+CORSMiddleware,
+allow_origins=[""],
+allow_credentials=False,
+allow_methods=[""],
+allow_headers=["*"],
+expose_headers=["Retry-After"]
 )
 
-# In-memory dictionary to bucket requests by X-Client-Id
-rate_limits = defaultdict(list)
+==========================================
+
+1. Global State & Configurations
+
+==========================================
+
+TOTAL_ORDERS = 55
+RATE_LIMIT = 15
+WINDOW_SECONDS = 10
+
+Fixed catalog of orders for the GET endpoint (IDs 1 through 55)
+
+CATALOG = [{"id": i, "product": f"Item {i}", "amount": 100} for i in range(1, TOTAL_ORDERS + 1)]
+
+State dictionaries for tracking
+
+client_requests = defaultdict(list)
+idempotency_cache = {}
+next_new_order_id = TOTAL_ORDERS + 1  # Ensures POSTs get new IDs starting at 56
+
+==========================================
+
+2. Per-Client Rate Limiting Middleware
+
+==========================================
 
 @app.middleware("http")
-async def context_and_rate_limit_middleware(request: Request, call_next):
-    # We only apply the strict rate limit to /ping. 
-    # We bypass it for /extract so the grader doesn't accidentally get blocked.
-    if request.url.path != "/ping":
-        return await call_next(request)
+async def rate_limiter(request: Request, call_next):
+# Ignore OPTIONS preflight checks so they don't get accidentally blocked
+if request.method == "OPTIONS":
+return await call_next(request)
 
-    # Middleware 1: Request Context (Incoming)
-    req_id = request.headers.get("X-Request-ID")
-    if not req_id:
-        req_id = str(uuid.uuid4())
+client_id = request.headers.get("X-Client-Id")
+
+if client_id:
+    now = time.time()
+    # Remove timestamps older than our 10-second window
+    client_requests[client_id] = [t for t in client_requests[client_id] if now - t < WINDOW_SECONDS]
     
-    request.state.request_id = req_id
-
-    # Middleware 3: Per-Client Rate Limiter
-    client_id = request.headers.get("X-Client-Id")
-    if client_id:
-        now = time.time()
-        rate_limits[client_id] = [t for t in rate_limits[client_id] if now - t < 10]
+    # Check if the client has hit the limit of 15 requests
+    if len(client_requests[client_id]) >= RATE_LIMIT:
+        # Calculate time remaining until they are unblocked
+        oldest_request_time = client_requests[client_id][0]
+        retry_after = int(WINDOW_SECONDS - (now - oldest_request_time))
         
-        if len(rate_limits[client_id]) >= 11:
-            response = JSONResponse({"detail": "Too Many Requests"}, status_code=429)
-            response.headers["X-Request-ID"] = req_id
-            return response
-            
-        rate_limits[client_id].append(now)
-
-    response = await call_next(request)
-
-    # Middleware 1: Request Context (Outgoing)
-    response.headers["X-Request-ID"] = req_id
-    return response
-
-
-# ==========================================
-# Endpoint 1: Ping
-# ==========================================
-@app.get("/ping")
-async def ping_endpoint(request: Request):
-    return {
-        "email": "22ds2000150@ds.study.iitm.ac.in",
-        "request_id": getattr(request.state, "request_id", "unknown")
-    }
-
-
-# ==========================================
-# Endpoint 2: Invoice Extractor (Mock LLM)
-# ==========================================
-class ExtractRequest(BaseModel):
-    text: str
-
-class ExtractResponse(BaseModel):
-    vendor: str
-    amount: float
-    currency: str
-    date: str
-
-@app.post("/extract", response_model=ExtractResponse)
-async def extract_invoice(request: ExtractRequest):
-    text = request.text
-    
-    # 1. Fallback for empty input (Prevents HTTP 500)
-    if not text or not isinstance(text, str):
-        return ExtractResponse(vendor="Unknown", amount=0.0, currency="USD", date="2026-01-01")
+        # CRITICAL FIX: Manually inject CORS headers into the 429 response!
+        return JSONResponse(
+            content={"error": "Too Many Requests"}, 
+            status_code=429, 
+            headers={
+                "Retry-After": str(max(1, retry_after)),
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Retry-After"
+            }
+        )
         
-    # 2. Extract Currency (USD/EUR/GBP)
-    curr_match = re.search(r'\b(USD|EUR|GBP)\b', text, re.IGNORECASE)
-    currency = curr_match.group(1).upper() if curr_match else "USD"
+    # Log this request's timestamp
+    client_requests[client_id].append(now)
     
-    # 3. Extract Date (2026-MM-DD)
-    date_match = re.search(r'\b(2026-\d{2}-\d{2})\b', text)
-    date = date_match.group(1) if date_match else "2026-01-01"
+return await call_next(request)
+
+
+==========================================
+
+Cursor Helper Functions
+
+==========================================
+
+def encode_cursor(index: int) -> str:
+"""Takes an integer index and returns an opaque base64 string"""
+return base64.b64encode(str(index).encode()).decode('utf-8')
+
+def decode_cursor(cursor: str) -> int:
+"""Takes a base64 string and decodes it back to an integer index"""
+try:
+return int(base64.b64decode(cursor).decode('utf-8'))
+except Exception:
+return 0
+
+==========================================
+
+3. Endpoints
+
+==========================================
+
+@app.post("/orders")
+async def create_order(request: Request, response: Response):
+global next_new_order_id
+idem_key = request.headers.get("Idempotency-Key")
+
+# IDEMPOTENCY CHECK: If the key was already used, return the exact same response!
+if idem_key and idem_key in idempotency_cache:
+    response.status_code = 201
+    return idempotency_cache[idem_key]
     
-    # 4. Extract Amount (50-9050)
-    valid_amount = 0.0
+# Otherwise, create a brand new order
+new_order = {
+    "id": next_new_order_id,
+    "status": "processing",
+    "created_at": time.time()
+}
+next_new_order_id += 1
+
+# Save to cache so future requests with this key get the same data
+if idem_key:
+    idempotency_cache[idem_key] = new_order
     
-    # Strategy A: Near currency (e.g. 123.45 USD or $123.45)
-    curr_match_amount = re.search(r'\b(\d+(?:\.\d{1,2})?)\s*(?:USD|EUR|GBP)\b', text, re.IGNORECASE)
-    if not curr_match_amount:
-        curr_match_amount = re.search(r'(?:USD|EUR|GBP|\$|€|£)\s*(\d+(?:\.\d{1,2})?)', text, re.IGNORECASE)
-        
-    if curr_match_amount:
-        try:
-            val = float(curr_match_amount.group(1))
-            if 50 <= val <= 9050:
-                valid_amount = val
-        except ValueError:
-            pass
+response.status_code = 201
+return new_order
 
-    # Strategy B: Near keywords (Total, Amount, Due)
-    if valid_amount == 0.0:
-        keyword_match = re.search(r'\b(?:total|amount|due|balance)[\s:]*(\d+(?:\.\d{1,2})?)\b', text, re.IGNORECASE)
-        if keyword_match:
-            try:
-                val = float(keyword_match.group(1))
-                if 50 <= val <= 9050:
-                    valid_amount = val
-            except ValueError:
-                pass
 
-    # Strategy C: First float in range (e.g. 6856.26 instead of 1707)
-    if valid_amount == 0.0:
-        amounts = re.findall(r'\b(\d+(?:\.\d{1,2})?)\b', text)
-        for a in amounts:
-            if '.' in a:
-                try:
-                    val = float(a)
-                    if 50 <= val <= 9050:
-                        valid_amount = val
-                        break
-                except ValueError:
-                    continue
+@app.get("/orders")
+async def get_orders(limit: int = 10, cursor: str = None):
+# Figure out where to start in the list based on the opaque cursor
+start_idx = 0
+if cursor:
+start_idx = decode_cursor(cursor)
 
-    # Strategy D: Any number in range
-    if valid_amount == 0.0:
-        amounts = re.findall(r'\b(\d+(?:\.\d{1,2})?)\b', text)
-        for a in amounts:
-            try:
-                val = float(a)
-                if 50 <= val <= 9050:
-                    valid_amount = val
-                    break
-            except ValueError:
-                continue
-            
-    # 5. Extract Vendor (Planted pattern e.g., Acme-xxxx Industries Ltd.)
-    vendor = "Unknown Vendor"
-    acme_match = re.search(r'(Acme-[a-zA-Z0-9]+(?:[\s\-]+[A-Za-z0-9]+)*\s*(?:Industries|Corp|LLC|Inc|Ltd\.?)?)', text, re.IGNORECASE)
-    if acme_match:
-        vendor = acme_match.group(1).strip()
-    else:
-        generic_match = re.search(r'([A-Z][\w\-]+\s+(?:[\w\-]+\s+)*(?:Industries|Corp|LLC|Inc|Ltd\.?))', text)
-        if generic_match:
-            vendor = generic_match.group(1).strip()
-            
-    return ExtractResponse(
-        vendor=vendor,
-        amount=valid_amount,
-        currency=currency,
-        date=date
-    )
+end_idx = start_idx + limit
+
+# Slice the items from our fixed catalog (1 to 55)
+items = CATALOG[start_idx:end_idx]
+
+# If there is more data left, generate a new cursor for the next page
+next_cursor = None
+if end_idx < TOTAL_ORDERS:
+    next_cursor = encode_cursor(end_idx)
+    
+return {
+    "items": items,
+    "next_cursor": next_cursor
+}
